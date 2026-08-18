@@ -407,6 +407,38 @@ class AppHelperRegressionTests(unittest.TestCase):
 
         self.assertEqual(round(impact, 2), -0.10)
 
+    def test_tsc_price_impact_matches_reference_workbook_price_first_bridge(self):
+        cases = [
+            {
+                "month_unit": 10.20125962732919,
+                "reference_unit": 11.472492622704,
+                "reference_util": 0.7323095453176754,
+                "reference_loss": 0.01565793435712132,
+                "reference_raw_cost": 11.91521196178327,
+                "expected": -1.3202894166807013,
+            },
+            {
+                "month_unit": 9.750548765533804,
+                "reference_unit": 11.23187217221762,
+                "reference_util": 0.9067065516412489,
+                "reference_loss": 0.04305440559814106,
+                "reference_raw_cost": 11.7963276782684,
+                "expected": -1.5557670203863339,
+            },
+        ]
+
+        for case in cases:
+            with self.subTest(month_unit=case["month_unit"]):
+                impact = APP._tsc_price_impact(
+                    case["month_unit"],
+                    case["reference_util"],
+                    case["reference_loss"],
+                    case["reference_raw_cost"],
+                    factor=0.95,
+                    diff_unit=case["month_unit"] - case["reference_unit"],
+                )
+                self.assertAlmostEqual(impact, case["expected"], places=12)
+
     def test_tsc_reference_diff_matches_standard_if_reference_positive_rule(self):
         self.assertEqual(APP._tsc_reference_diff(12.5, 10.0), 2.5)
         self.assertEqual(APP._tsc_reference_diff(12.5, 0.0), 0.0)

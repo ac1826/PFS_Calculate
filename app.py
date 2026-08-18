@@ -605,6 +605,28 @@ def _tsc_raw_cost_by(unit_price, util_rate, loss_rate, factor):
     return (unit_price - (1 - util_rate - loss_rate) * unit_price * factor) / util_rate
 
 
+def _tsc_price_impact(
+    month_unit,
+    reference_util,
+    reference_loss,
+    reference_raw_cost,
+    factor,
+    diff_unit,
+):
+    """Match the reference workbook's price-first variance bridge."""
+    if diff_unit == 0:
+        return 0.0
+    bridged_cost = _tsc_raw_cost_by(
+        month_unit,
+        reference_util,
+        reference_loss,
+        factor,
+    )
+    if bridged_cost is not None and reference_raw_cost is not None:
+        return bridged_cost - reference_raw_cost
+    return None
+
+
 def _recalculate_tsc_reference_metrics(metrics, factor):
     out = dict(metrics or {})
     raw_cost = _tsc_raw_cost_by(
@@ -2285,22 +2307,17 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
             })
 
             # 参考表“对半成品成本的影响-单位成本”分解口径
-            # 1) 单价影响：S(月) - RawCost(Q3单价, 月利用率, 月损耗率)
+            # 1) 单价影响：RawCost(月单价, 参考利用率, 参考损耗率) - 参考原料成本。
+            # This is the price-first bridge used by the reference workbook.
             if has_reference_metrics:
-                unit_impact_price = None
-                if diff_unit not in (None, 0):
-                    rc = _raw_cost_by(
-                        q3_metrics.get('修形前原料综合耗用单价'),
-                        month_util,
-                        month_loss,
-                        factor,
-                    )
-                    if month_raw_cost is not None and rc is not None:
-                        unit_impact_price = month_raw_cost - rc
-                    else:
-                        unit_impact_price = 0
-                elif diff_unit == 0:
-                    unit_impact_price = 0.0
+                unit_impact_price = _tsc_price_impact(
+                    month_unit,
+                    q3_metrics.get('修形利用率'),
+                    q3_metrics.get('损耗率'),
+                    q3_metrics.get('半成品原料成本'),
+                    factor,
+                    diff_unit,
+                )
 
                 # 2) 损耗率影响：按参考表公式口径，只有参考损耗率大于 0 时才分解损耗影响。
                 unit_impact_loss = _tsc_loss_impact(
