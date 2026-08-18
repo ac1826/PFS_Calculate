@@ -59,6 +59,164 @@ TSC_REFERENCE_METRIC_KEYS = [
 ]
 FIXED_OTHER_SCRAP_FACTORS = {}
 
+LEG_TSC_SPECS = [
+    '无规格', '80g', '110G', '120g以上', '150g以上',
+    '120-170g', '170-220', '245-285g', '其他规格',
+]
+BREAST_TSC_SPECS = [
+    '无规格', '180g以上', '180-220g', '200g', '220g以上', '220-260g',
+    '260g以上', '200-300', '220-300', '260-300g', '300g', '170-220g',
+    '其他规格',
+]
+TSC_USAGE_SPECS = {
+    '腿肉': LEG_TSC_SPECS,
+    '胸肉': BREAST_TSC_SPECS,
+    '特殊': BREAST_TSC_SPECS,
+    '其他': [],
+}
+
+
+def _fresh_frozen_from_desc(value):
+    text = _clean_colname(value) if value is not None else ''
+    if '冻品' in text or text.endswith('冻'):
+        return '冻品'
+    if '鲜品' in text or text.endswith('鲜'):
+        return '鲜品'
+    return None
+
+
+def _normalize_spec_text(value):
+    if value is None or pd.isna(value):
+        return ''
+    text = str(value).strip().replace('～', '-').replace('—', '-').replace('–', '-')
+    text = re.sub(r'\s+', '', text)
+    return text.lower()
+
+
+def _normalize_spec_bucket(category, spec_value, raw_desc=''):
+    specs = TSC_USAGE_SPECS.get(category, [])
+    if not specs:
+        return ''
+    source = _normalize_spec_text(spec_value)
+    if not source:
+        source = _normalize_spec_text(raw_desc)
+    aliases = {
+        '无规格': {'无规格', '无规', '不限规格'},
+        '80g': {'80g', '80克'},
+        '110G': {'110g', '110克'},
+        '120g以上': {'120g以上', '120克以上', '≥120g', '120g+'},
+        '150g以上': {'150g以上', '150克以上', '≥150g', '150g+'},
+        '120-170g': {'120-170g', '120-170克'},
+        '170-220': {'170-220', '170-220g', '170-220克'},
+        '245-285g': {'245-285g', '245-285克'},
+        '180g以上': {'180g以上', '180克以上', '≥180g', '180g+'},
+        '180-220g': {'180-220g', '180-220克'},
+        '200g': {'200g', '200克'},
+        '220g以上': {'220g以上', '220克以上', '≥220g', '220g+'},
+        '220-260g': {'220-260g', '220-260克'},
+        '260g以上': {'260g以上', '260克以上', '≥260g', '260g+'},
+        '200-300': {'200-300', '200-300g', '200-300克'},
+        '220-300': {'220-300', '220-300g', '220-300克'},
+        '260-300g': {'260-300g', '260-300克'},
+        '300g': {'300g', '300克'},
+        '170-220g': {'170-220g', '170-220克'},
+    }
+    for spec in specs:
+        if spec == '其他规格':
+            continue
+        normalized_aliases = {_normalize_spec_text(v) for v in aliases.get(spec, {spec})}
+        if source in normalized_aliases:
+            return spec
+        if any(a and a in source for a in sorted(normalized_aliases, key=len, reverse=True)):
+            return spec
+    return '其他规格'
+
+
+def _tsc_matrix_columns(category):
+    specs = TSC_USAGE_SPECS.get(category, [])
+    if category == '其他':
+        return ['鲜品', '冻品', '鲜冻品合计']
+    columns = []
+    for kind in ('鲜品', '冻品'):
+        columns.extend(f'{kind}|{spec}' for spec in specs)
+        columns.append(f'{kind}合计')
+    columns.append('累计')
+    return columns
+
+
+def _load_raw_spec_metadata(tsc_file):
+    """Read 原料号 -> category/spec/description/fresh-frozen from 原料规格."""
+    try:
+        df = pd.read_excel(_as_bytes_io(tsc_file), sheet_name='原料规格', header=None)
+    except Exception:
+        return {}
+    header_row = None
+    header_map = {}
+    for r in range(min(len(df), 30)):
+        values = [_clean_colname(v) for v in df.iloc[r].tolist()]
+        code_col = _find_tsc_header_col(values, ['物料号', '原料号', '物料编码', '原料编码'])
+        spec_col = _find_tsc_header_col(values, ['规格'])
+        if code_col is not None and spec_col is not None:
+            header_row = r
+            header_map = {
+                'code': code_col,
+                'spec': spec_col,
+                'category': _find_tsc_header_col(values, ['分类', '部位']),
+                'desc': _find_tsc_header_col(values, ['原料描述', '物料描述', '原料名称', '物料名称']),
+                'fresh_frozen': _find_tsc_header_col(values, ['鲜冻属性', '鲜冻品', '鲜冻']),
+            }
+            break
+    if header_row is None:
+        return {}
+    out = {}
+    for r in range(header_row + 1, len(df)):
+        code = _normalize_mat(df.iat[r, header_map['code']])
+        if not code:
+            continue
+        desc_col = header_map.get('desc')
+        ff_col = header_map.get('fresh_frozen')
+        desc = '' if desc_col is None or pd.isna(df.iat[r, desc_col]) else str(df.iat[r, desc_col]).strip()
+        ff_value = '' if ff_col is None or pd.isna(df.iat[r, ff_col]) else str(df.iat[r, ff_col]).strip()
+        category_col = header_map.get('category')
+        category = '' if category_col is None or pd.isna(df.iat[r, category_col]) else str(df.iat[r, category_col]).strip()
+        spec_val = df.iat[r, header_map['spec']]
+        out[code] = {
+            'category': category,
+            'spec': '' if pd.isna(spec_val) else str(spec_val).strip(),
+            'description': desc,
+            'fresh_frozen': _fresh_frozen_from_desc(ff_value) or _fresh_frozen_from_desc(desc),
+        }
+    return out
+
+
+def _aggregate_tsc_usage_rows(rows, category, raw_metadata=None, raw_desc_map=None):
+    """Aggregate positive raw usage into stable fresh/frozen specification keys."""
+    raw_metadata = raw_metadata or {}
+    raw_desc_map = raw_desc_map or {}
+    matrix_cols = _tsc_matrix_columns(category)
+    qty_by_key = {key: 0.0 for key in matrix_cols}
+    amt_by_key = {key: 0.0 for key in matrix_cols}
+    unknown_fresh_frozen = []
+    for _, row in rows.iterrows():
+        code = _normalize_mat(row.get('原料号_raw', row.get('原料号', '')))
+        qty = float(row.get('正向数量', 0) or 0)
+        amt = float(row.get('正向金额', 0) or 0)
+        if qty <= 0 or code == '人工费用':
+            continue
+        meta = raw_metadata.get(code, {})
+        desc = raw_desc_map.get(code, '') or meta.get('description', '')
+        kind = meta.get('fresh_frozen') or _fresh_frozen_from_desc(desc)
+        if not kind:
+            unknown_fresh_frozen.append((code, desc))
+            continue
+        key = kind if category == '其他' else f'{kind}|{_normalize_spec_bucket(category, meta.get("spec"), desc)}'
+        qty_by_key[key] = qty_by_key.get(key, 0.0) + qty
+        amt_by_key[key] = amt_by_key.get(key, 0.0) + amt
+    if unknown_fresh_frozen:
+        details = '；'.join(f'{code}（{desc or "无描述"}）' for code, desc in unknown_fresh_frozen)
+        raise ValueError(f'以下原料无法识别鲜品/冻品属性，已阻止导出：{details}')
+    return qty_by_key, amt_by_key
+
 
 def _is_display_number(val):
     return isinstance(val, (int, float)) and not isinstance(val, bool) and not pd.isna(val)
@@ -394,12 +552,15 @@ def _load_rawlist(rawlist_file):
         df = df.copy()
         df.columns = [_clean_colname(c) for c in df.columns]
         if '原料号' in df.columns and '部位' in df.columns:
-            frames.append(df[['原料号', '部位']])
+            if '特殊分类' not in df.columns:
+                df['特殊分类'] = ''
+            frames.append(df[['原料号', '部位', '特殊分类']])
     if not frames:
-        return pd.DataFrame(columns=['原料号', '部位'])
+        return pd.DataFrame(columns=['原料号', '部位', '特殊分类'])
     raw = pd.concat(frames, ignore_index=True)
     raw['原料号'] = raw['原料号'].apply(_normalize_mat)
     raw['部位'] = raw['部位'].fillna('').astype(str).str.strip()
+    raw['特殊分类'] = raw['特殊分类'].fillna('').astype(str).str.strip()
     return raw
 
 
@@ -411,11 +572,16 @@ def _category_from_part(part):
     return '其他'
 
 
+def _calculation_category_from_rawlist(part, special_category=''):
+    return '特殊' if str(special_category or '').strip() == '特殊' else _category_from_part(part)
+
+
 def _tsc_sheet_name_for_category(category):
     return {
         '腿肉': '腿肉TSC',
         '胸肉': '胸肉TSC',
         '其他': '其他TSC',
+        '特殊': '特殊TSC',
     }.get(str(category).strip(), '胸肉TSC')
 
 
@@ -448,7 +614,7 @@ def _scrap_factor_for_category(category, material_desc='', material_no='', has_n
         except Exception:
             pass
     cat = str(category).strip()
-    if cat == '其他':
+    if cat in {'其他', '特殊'}:
         if other_factor not in (None, ''):
             try:
                 return float(other_factor)
@@ -597,6 +763,28 @@ def _tsc_raw_cost_by(unit_price, util_rate, loss_rate, factor):
     return (unit_price - (1 - util_rate - loss_rate) * unit_price * factor) / util_rate
 
 
+def _tsc_price_impact(
+    month_unit,
+    reference_util,
+    reference_loss,
+    reference_raw_cost,
+    factor,
+    diff_unit,
+):
+    """Match the reference workbook's price-first variance bridge."""
+    if diff_unit == 0:
+        return 0.0
+    bridged_cost = _tsc_raw_cost_by(
+        month_unit,
+        reference_util,
+        reference_loss,
+        factor,
+    )
+    if bridged_cost is not None and reference_raw_cost is not None:
+        return bridged_cost - reference_raw_cost
+    return None
+
+
 def _recalculate_tsc_reference_metrics(metrics, factor):
     out = dict(metrics or {})
     raw_cost = _tsc_raw_cost_by(
@@ -643,11 +831,27 @@ def _tsc_loss_impact_factor(factor):
     return 1.0 if abs(val) <= 1e-12 else val
 
 
-def _tsc_loss_impact(month_raw_cost, month_unit, month_util, q3_loss_raw, factor, diff_loss):
+def _tsc_loss_impact(
+    month_raw_cost,
+    month_unit,
+    month_util,
+    q3_loss_raw,
+    factor,
+    diff_loss,
+    month_loss=None,
+    category=None,
+):
     if diff_loss == 0:
         return 0.0
     if month_unit is not None and month_util not in (None, 0) and q3_loss_raw is not None:
-        rc = _tsc_raw_cost_by(month_unit, month_util, q3_loss_raw, factor)
+        effective_factor = factor
+        if str(category or '').strip() in {'其他', '特殊'} and month_loss is not None:
+            try:
+                if float(month_util) + float(month_loss) >= 1.0:
+                    effective_factor = 1.0
+            except Exception:
+                pass
+        rc = _tsc_raw_cost_by(month_unit, month_util, q3_loss_raw, effective_factor)
         if month_raw_cost is not None and rc is not None:
             return month_raw_cost - rc
         return 0
@@ -855,6 +1059,102 @@ def _find_tsc_reference_ratio_row_values(df, material_no, reference_label, quart
     return _find_tsc_row_values(df, material_no, reference_label, raw_cols, comp_col)
 
 
+def _find_tsc_matrix_reference_values(
+    df,
+    material_no,
+    reference_label,
+    quarter_label,
+    category,
+    raw_metadata,
+    legacy_raw_cols=None,
+    legacy_spec_map=None,
+    label_kind='ratio',
+):
+    """Read matrix values from either the new grouped or legacy raw-code table."""
+    if df is None:
+        return {}
+    context = _get_tsc_lookup_context(df)
+    if context is None:
+        return {}
+    labels = [reference_label]
+    quarter_labels = _quarter_ratio_labels(quarter_label) if label_kind == 'ratio' else _quarter_actual_labels(quarter_label)
+    labels = quarter_labels + labels
+    row_idx = None
+    key_cols = context['key_cols']
+    mat_col = key_cols.get('mat_col', 2)
+    label_col = key_cols.get('label_col', 4)
+    for label in labels:
+        for r in range(context['start_row'], len(df)):
+            mat = _normalize_mat(df.iat[r, mat_col]) if mat_col < df.shape[1] else ''
+            row_label = str(df.iat[r, label_col]).strip() if label_col < df.shape[1] else ''
+            if mat == _normalize_mat(material_no) and _match_tsc_row_label(row_label, label):
+                row_idx = r
+                break
+        if row_idx is not None:
+            break
+    if row_idx is None:
+        return {}
+
+    specs = TSC_USAGE_SPECS.get(category, [])
+    result = {}
+    header_limit = min(context['start_row'], 8)
+    # New format: find each visible spec header and associate it with the nearest
+    # fresh/frozen group start to its left.
+    group_starts = []
+    for r in range(header_limit):
+        for c in range(df.shape[1]):
+            val = _clean_colname(df.iat[r, c])
+            if val in {'鲜品', '冻品'}:
+                group_starts.append((c, val))
+    group_starts = sorted(set(group_starts))
+    if category == '其他':
+        for c, kind in group_starts:
+            val = df.iat[row_idx, c]
+            if not _is_missing_number(val):
+                result[kind] = float(val)
+        if result:
+            return result
+    else:
+        for c in range(df.shape[1]):
+            header_values = [str(df.iat[r, c]).strip() for r in range(header_limit) if not pd.isna(df.iat[r, c])]
+            spec = next((s for s in specs if any(_normalize_spec_text(v) == _normalize_spec_text(s) for v in header_values)), None)
+            if spec is None:
+                continue
+            kind = None
+            for start_col, candidate in group_starts:
+                if start_col <= c:
+                    kind = candidate
+                elif start_col > c:
+                    break
+            if kind is None:
+                continue
+            val = df.iat[row_idx, c]
+            if not _is_missing_number(val):
+                result[f'{kind}|{spec}'] = float(val)
+        if result:
+            return result
+
+    # Legacy format: raw material codes are converted through 原料规格 metadata.
+    legacy_raw_cols = legacy_raw_cols or []
+    legacy_spec_map = legacy_spec_map or {}
+    for c, code in legacy_raw_cols:
+        val = df.iat[row_idx, c]
+        if _is_missing_number(val):
+            continue
+        meta = raw_metadata.get(code, {})
+        desc = meta.get('description') or legacy_spec_map.get(code, '')
+        kind = meta.get('fresh_frozen') or _fresh_frozen_from_desc(desc)
+        if not kind:
+            continue
+        if category == '其他':
+            key = kind
+        else:
+            spec = _normalize_spec_bucket(category, meta.get('spec'), desc)
+            key = f'{kind}|{spec}'
+        result[key] = result.get(key, 0.0) + float(val)
+    return result
+
+
 def _load_compare_df(compare_file, sheet_name=None):
     df = pd.read_excel(compare_file, sheet_name=sheet_name or 0)
     df = _normalize_columns(df)
@@ -928,7 +1228,7 @@ def _resolve_tsc_quarter_label(tsc_file, preferred='Q3'):
 
     scores = {q: 0 for q in VALID_QUARTER_LABELS}
 
-    for sn in ['腿肉TSC', '胸肉TSC']:
+    for sn in ['腿肉TSC', '胸肉TSC', '特殊TSC']:
         try:
             df = pd.read_excel(_as_bytes_io(tsc_file), sheet_name=sn, header=None)
         except Exception:
@@ -1081,6 +1381,7 @@ def _load_market_price_map(source=None):
         '基期行情价': ['基期行情价', '基期价格', '季度行情价'],
         '当前行情价': ['当前行情价', '当前价格', '本月行情价'],
     }
+    scope_aliases = {'适用范围', '价格类型'}
     for idx, row in enumerate(rows[:20]):
         cleaned = [_clean_colname(v) for v in row]
         candidate = {}
@@ -1093,6 +1394,10 @@ def _load_market_price_map(source=None):
         if all(k in candidate for k in required):
             header_row = idx
             header_map = candidate
+            header_map['适用范围'] = next(
+                (col_idx for col_idx, cell in enumerate(cleaned) if cell in scope_aliases),
+                None,
+            )
             break
     if header_row is None:
         return {}
@@ -1103,32 +1408,65 @@ def _load_market_price_map(source=None):
         category = str(row[header_map['分类']] or '').strip()
         if not plant or not category:
             continue
+        scope_col = header_map.get('适用范围')
+        scope_value = row[scope_col] if scope_col is not None and scope_col < len(row) else None
+        scope = '特殊' if str(scope_value or '').strip() == '特殊' else '普通'
         base_price = _to_optional_float(row[header_map['基期行情价']])
         current_price = _to_optional_float(row[header_map['当前行情价']])
-        out[(plant, category)] = {
+        record = {
             '基期行情价': base_price,
             '当前行情价': current_price,
         }
+        out[(plant, category, scope)] = record
+        if scope == '普通':
+            out[(plant, category)] = record
     return out
 
 
-def _market_price_pair(market_price_map, plant, category):
+def _market_price_pair(market_price_map, plant, category, scope='普通'):
     if not market_price_map:
         return None, None
     plant_key = str(plant or '').strip()
     category_key = str(category or '').strip()
-    rec = market_price_map.get((plant_key, category_key))
+    scope_key = '特殊' if str(scope or '').strip() == '特殊' else '普通'
+    rec = market_price_map.get((plant_key, category_key, scope_key))
     if rec is None:
+        rec = market_price_map.get((plant_key.upper(), category_key, scope_key))
+    # Keep direct callers using the historical two-part map compatible for normal prices only.
+    if rec is None and scope_key == '普通':
+        rec = market_price_map.get((plant_key, category_key))
+    if rec is None and scope_key == '普通':
         rec = market_price_map.get((plant_key.upper(), category_key))
     if rec is None:
         return None, None
     return rec.get('基期行情价'), rec.get('当前行情价')
 
 
-def _build_market_comparison_sheet(tsc_export_df, plant, category, month_label, market_price_map, quarter_label=DEFAULT_QUARTER_LABEL):
+def _build_market_comparison_sheet(
+    tsc_export_df,
+    plant,
+    category,
+    month_label,
+    market_price_map,
+    quarter_label=DEFAULT_QUARTER_LABEL,
+    market_category_by_material=None,
+    calculation_category=None,
+    factor_by_material=None,
+    market_scope='普通',
+):
     if tsc_export_df is None or tsc_export_df.empty:
         return None
-    base_price, current_price = _market_price_pair(market_price_map, plant, category)
+    market_category_by_material = {
+        _normalize_mat(k): str(v or '').strip()
+        for k, v in (market_category_by_material or {}).items()
+        if _normalize_mat(k)
+    }
+    factor_by_material = {
+        _normalize_mat(k): v
+        for k, v in (factor_by_material or {}).items()
+        if _normalize_mat(k)
+    }
+    cost_category = str(calculation_category or category).strip()
     df = tsc_export_df.copy()
     if '基期行情价' not in df.columns:
         df['基期行情价'] = None
@@ -1199,6 +1537,15 @@ def _build_market_comparison_sheet(tsc_export_df, plant, category, month_label, 
                 df.at[row_idx, col] = 0.0
         return 0.0, 0.0
 
+    def _clear_market_calculation_rows(row_indexes):
+        calculation_cols = ['综合单价'] + cost_cols
+        for row_idx in row_indexes:
+            if row_idx is None:
+                continue
+            for col in calculation_cols:
+                if col in df.columns:
+                    df.at[row_idx, col] = None
+
     for mat, group in data.groupby(data['修行后原料'].apply(_normalize_mat), sort=False):
         if not mat:
             continue
@@ -1230,11 +1577,26 @@ def _build_market_comparison_sheet(tsc_export_df, plant, category, month_label, 
         labor = _to_optional_float(df.at[cur_idx, '半成品修形人工成本']) if '半成品修形人工成本' in df.columns else None
         in_qty = _to_optional_float(df.at[cur_idx, '半成品入库量']) if '半成品入库量' in df.columns else None
         mat_desc = df.at[cur_idx, '使用半成品规格'] if '使用半成品规格' in df.columns else ''
-        material_factor = factor_map.get(mat)
-        factor = _scrap_factor_for_category(category, mat_desc, mat, True, None, material_factor)
+        market_category = market_category_by_material.get(mat, category)
+        base_price, current_price = _market_price_pair(
+            market_price_map,
+            plant,
+            market_category,
+            market_scope,
+        )
+        material_factor = factor_by_material.get(mat, factor_map.get(mat))
+        factor = _scrap_factor_for_category(cost_category, mat_desc, mat, True, None, material_factor)
 
         df.at[cur_idx, '基期行情价'] = base_price
         df.at[cur_idx, '当前行情价'] = current_price
+        if str(market_scope or '').strip() == '特殊' and (base_price is None or current_price is None):
+            if ref_idx is not None:
+                if '行类型' in df.columns:
+                    df.at[ref_idx, '行类型'] = f'25年{quarter_label}实际单价'
+                df.at[ref_idx, '基期行情价'] = base_price
+                df.at[ref_idx, '当前行情价'] = current_price
+            _clear_market_calculation_rows(group_idx)
+            continue
         current_raw, current_total = _set_costs(cur_idx, current_price, util, loss, labor, factor)
 
         ref_raw = ref_total = None
@@ -1537,6 +1899,7 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
 
     rawlist = _load_rawlist(rawlist_file)
     raw_map = dict(zip(rawlist['原料号'], rawlist['部位']))
+    raw_special_map = dict(zip(rawlist['原料号'], rawlist['特殊分类']))
     raw_set = set(raw_map.keys())
 
     df['物料号'] = df['物料号'].apply(_normalize_mat)
@@ -1557,6 +1920,16 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
     fallback_price_label = f'{quarter_label}实际单价'
     fallback_ratio_label = f'{quarter_label}规格占比'
     byproduct_factor_map = _current_byproduct_factor_map()
+    # 新增排除规则：物料所有非空非人工费用的原料行，若原料描述都包含"碎肉"，则从所有输出中排除
+    _scrap_desc_rows = (
+        df[df["原料号"].notna()
+           & (df["原料号"].astype(str).str.strip() != "")
+           & (df["原料号"].astype(str).str.strip() != "人工费用")]
+    )
+    excluded_all_scrap_desc_mats = set()
+    for mat, grp in _scrap_desc_rows.groupby("物料号"):
+        if len(grp) > 0 and grp["原料描述"].apply(lambda x: "碎肉" in str(x)).all():
+            excluded_all_scrap_desc_mats.add(mat)
 
     # 入库数量从物料号主行提取（原料号为空）
     header_in_qty = (
@@ -1755,12 +2128,11 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
         finished_df['系列'] = finished_df['原料号'].apply(lambda x: semi_category.get(_normalize_mat(x), ''))
 
         def _part_from_raw(raw):
-            p = raw_map.get(_normalize_mat(raw), '')
-            if p == '胸类':
-                return '胸肉'
-            if p == '腿类':
-                return '腿肉'
-            return ''
+            mat = _normalize_mat(raw)
+            return _calculation_category_from_rawlist(
+                raw_map.get(mat, ''),
+                raw_special_map.get(mat, ''),
+            )
 
         finished_df['部位'] = finished_df['原料号'].apply(_part_from_raw)
         if month_code and str(month_code).strip() != '':
@@ -1797,7 +2169,7 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
             finished_df['原料号'].astype(str).str.startswith('3900')
             & finished_df['物料号'].astype(str).str.match(r'^[A-Za-z]')
         ].copy()
-        part_order_map = {'胸肉': 0, '腿肉': 1}
+        part_order_map = {'胸肉': 0, '腿肉': 1, '特殊': 2, '其他': 3}
         finished_df['_part_order'] = finished_df['部位'].apply(
             lambda x: part_order_map.get(str(x).strip(), 2) if pd.notna(x) else 2
         )
@@ -1810,14 +2182,22 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
         ]
         finished_df = finished_df[[c for c in ordered if c in finished_df.columns]]
 
+        # 排除所有原料描述都含"碎肉"的物料
+        if not finished_df.empty and excluded_all_scrap_desc_mats:
+            finished_df = finished_df[~finished_df["物料号"].astype(str).isin(excluded_all_scrap_desc_mats)].copy()
+
+
     # Keep all materials/rows; do not filter by raw list
     df = df.copy()
 
     # Build material -> category mapping from raw list (by part)
     mapping = {}
+    market_category_mapping = {}
     for mat in df['物料号'].unique():
         part = raw_map.get(mat, '')
-        mapping[mat] = _category_from_part(part)
+        source_category = _category_from_part(part)
+        market_category_mapping[mat] = source_category
+        mapping[mat] = _calculation_category_from_rawlist(part, raw_special_map.get(mat, ''))
 
     df = df[df['物料号'].isin(mapping.keys())].copy()
 
@@ -1887,7 +2267,7 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
         table_factor = byproduct_factor_map.get(_normalize_mat(mat))
         if table_factor is not None:
             v['计价系数'] = table_factor
-        if v.get('分类') != '其他':
+        if v.get('分类') not in {'其他', '特殊'}:
             continue
         neg_qty = float(v.get('其他负值数量', 0.0) or 0.0)
         factor_num = float(v.get('其他负值系数分子', 0.0) or 0.0)
@@ -1965,6 +2345,8 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
         mat for mat, v in agg.items()
         if _is_scrap_semi_material(v.get('物料描述', ''))
     }
+    # 新增排除规则：物料所有非空含人工的原料描述都含“碎肉”的也不带入
+    excluded_scrap_tsc_mats |= excluded_all_scrap_desc_mats
 
     records = []
     for mat, v in agg.items():
@@ -2022,10 +2404,12 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
     raw_cols_legs, comp_col_legs, df_q3_legs, spec_map_legs = _get_tsc_raw_columns(q3_file, '腿肉TSC')
     raw_cols_breast, comp_col_breast, df_q3_breast, spec_map_breast = _get_tsc_raw_columns(q3_file, '胸肉TSC')
     raw_cols_other, comp_col_other, df_q3_other, spec_map_other = _get_tsc_raw_columns(q3_file, '其他TSC')
+    raw_cols_special, comp_col_special, df_q3_special, spec_map_special = _get_tsc_raw_columns(q3_file, '特殊TSC')
     q3_tsc_df_by_sheet = {
         '腿肉TSC': df_q3_legs,
         '胸肉TSC': df_q3_breast,
         '其他TSC': df_q3_other,
+        '特殊TSC': df_q3_special,
     }
     # Add reference actual price / current ratio / reference ratio rows
     extra_rows = []
@@ -2177,22 +2561,17 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
             })
 
             # 参考表“对半成品成本的影响-单位成本”分解口径
-            # 1) 单价影响：S(月) - RawCost(Q3单价, 月利用率, 月损耗率)
+            # 1) 单价影响：RawCost(月单价, 参考利用率, 参考损耗率) - 参考原料成本。
+            # This is the price-first bridge used by the reference workbook.
             if has_reference_metrics:
-                unit_impact_price = None
-                if diff_unit not in (None, 0):
-                    rc = _raw_cost_by(
-                        q3_metrics.get('修形前原料综合耗用单价'),
-                        month_util,
-                        month_loss,
-                        factor,
-                    )
-                    if month_raw_cost is not None and rc is not None:
-                        unit_impact_price = month_raw_cost - rc
-                    else:
-                        unit_impact_price = 0
-                elif diff_unit == 0:
-                    unit_impact_price = 0.0
+                unit_impact_price = _tsc_price_impact(
+                    month_unit,
+                    q3_metrics.get('修形利用率'),
+                    q3_metrics.get('损耗率'),
+                    q3_metrics.get('半成品原料成本'),
+                    factor,
+                    diff_unit,
+                )
 
                 # 2) 损耗率影响：按参考表公式口径，只有参考损耗率大于 0 时才分解损耗影响。
                 unit_impact_loss = _tsc_loss_impact(
@@ -2202,6 +2581,8 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
                     q3_metrics.get('损耗率'),
                     _tsc_loss_impact_factor(factor),
                     diff_loss,
+                    month_loss=month_loss,
+                    category=v.get('分类'),
                 )
 
                 # 3) 利用率影响：半成品原料成本差异 - 单价影响 - 损耗率影响
@@ -2291,6 +2672,9 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
     other = result[
         (result['分类'] == '其他') & (result['物料号'].astype(str).str.startswith('390'))
     ].sort_values(['物料号', '行序'])
+    special = result[
+        (result['分类'] == '特殊') & (result['物料号'].astype(str).str.startswith('390'))
+    ].sort_values(['物料号', '行序'])
 
     def _drop_excluded_tsc_mats(df_part):
         if not excluded_scrap_tsc_mats or df_part.empty:
@@ -2300,8 +2684,9 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
     legs_for_tsc = _drop_excluded_tsc_mats(legs)
     breast_for_tsc = _drop_excluded_tsc_mats(breast)
     other_for_tsc = _drop_excluded_tsc_mats(other)
+    special_for_tsc = _drop_excluded_tsc_mats(special)
 
-    # Build raw usage matrix (like TSC F:O)
+    # Build the fresh/frozen × specification usage matrix.
     df_calc = df.copy()
     df_calc = df_calc[df_calc['原料号'] != '']
     df_calc['正向数量'] = df_calc['实际数量'].where(df_calc['实际数量'] > 0, 0)
@@ -2313,7 +2698,6 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
         .rename(columns={'原料号': '原料号_raw'})
     )
 
-    aux_map = {k: v['调整后实际量'] for k, v in agg.items()}
     desc_map = {k: v['物料描述'] for k, v in agg.items()}
     raw_desc_map = {}
     raw_desc_src = df_calc.copy()
@@ -2329,86 +2713,123 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
             .to_dict()
         )
 
-    def _build_fallback_raw_columns(materials):
-        mat_set = {_normalize_mat(m) for m in materials if _normalize_mat(m)}
-        if not mat_set:
-            return [], {}
-        codes = []
-        seen = set()
-        src = grp[grp['物料号'].isin(mat_set)].sort_values(['原料号_raw']).reset_index(drop=True)
-        for _, r in src.iterrows():
-            code = _normalize_mat(r['原料号_raw'])
-            if not code or code == '人工费用' or code in seen:
-                continue
-            seen.add(code)
-            codes.append(code)
-        return list(enumerate(codes)), {code: raw_desc_map.get(code, '') for code in codes}
+    raw_metadata = _load_raw_spec_metadata(q3_file)
 
-    def build_matrix_rows(materials, raw_cols, comp_col, df_q3, category_label):
+    def build_matrix_rows(materials, legacy_raw_cols, legacy_comp_col, df_q3, legacy_spec_map, category_label):
         rows = []
         base_cols = ['物料号', '物料描述', '行类型', '分类']
-        raw_codes = [code for _, code in raw_cols]
+        matrix_cols = _tsc_matrix_columns(category_label)
         for mat in materials:
-            aux = aux_map.get(mat, 0)
+            mat = _normalize_mat(mat)
             mat_desc = desc_map.get(mat, '')
             mat_rows = grp[grp['物料号'] == mat]
-            raw_unit = {}
-            raw_ratio = {}
-            for _, r in mat_rows.iterrows():
-                code = _normalize_mat(r['原料号_raw'])
-                qty = r['正向数量']
-                amt = r['正向金额']
-                raw_unit[code] = (amt / qty) if qty != 0 else None
-                raw_ratio[code] = (qty / aux) if aux != 0 else None
+            qty_by_key, amt_by_key = _aggregate_tsc_usage_rows(
+                mat_rows,
+                category_label,
+                raw_metadata,
+                raw_desc_map,
+            )
 
-            q3_price = _find_tsc_reference_row_values(
+            total_qty = sum(qty_by_key.get(k, 0.0) for k in matrix_cols if '合计' not in k and k != '累计')
+            total_amt = sum(amt_by_key.get(k, 0.0) for k in matrix_cols if '合计' not in k and k != '累计')
+
+            def _with_summaries(source, value_kind):
+                out = dict(source)
+                if category_label == '其他':
+                    if value_kind == 'unit':
+                        out['鲜冻品合计'] = (total_amt / total_qty) if total_qty else None
+                    else:
+                        values = [out.get('鲜品'), out.get('冻品')]
+                        present = [v for v in values if not _is_missing_number(v)]
+                        out['鲜冻品合计'] = sum(present) if present else None
+                    return out
+                specs = TSC_USAGE_SPECS[category_label]
+                for kind in ('鲜品', '冻品'):
+                    keys = [f'{kind}|{spec}' for spec in specs]
+                    if value_kind == 'unit':
+                        q = sum(qty_by_key.get(k, 0.0) for k in keys)
+                        a = sum(amt_by_key.get(k, 0.0) for k in keys)
+                        out[f'{kind}合计'] = (a / q) if q else None
+                    else:
+                        values = [out.get(k) for k in keys]
+                        present = [v for v in values if not _is_missing_number(v)]
+                        out[f'{kind}合计'] = sum(present) if present else None
+                if value_kind == 'unit':
+                    out['累计'] = (total_amt / total_qty) if total_qty else None
+                else:
+                    values = [out.get('鲜品合计'), out.get('冻品合计')]
+                    present = [v for v in values if not _is_missing_number(v)]
+                    out['累计'] = sum(present) if present else None
+                return out
+
+            current_qty = {k: v / 1000 for k, v in qty_by_key.items() if '合计' not in k and k != '累计'}
+            current_qty = _with_summaries(current_qty, 'sum')
+            current_ratio = {
+                k: (v / total_qty if total_qty else None)
+                for k, v in qty_by_key.items() if '合计' not in k and k != '累计'
+            }
+            current_ratio = _with_summaries(current_ratio, 'sum')
+            current_unit = {
+                k: (amt_by_key.get(k, 0.0) / v if v else None)
+                for k, v in qty_by_key.items() if '合计' not in k and k != '累计'
+            }
+            current_unit = _with_summaries(current_unit, 'unit')
+
+            q3_amount = _find_tsc_matrix_reference_values(
                 df_q3,
                 mat,
                 reference_price_label,
                 quarter_label,
-                raw_cols,
-                comp_col,
-                prefer_quarter=False,
+                category_label,
+                raw_metadata,
+                legacy_raw_cols,
+                legacy_spec_map,
+                label_kind='actual',
             )
-            q3_ratio = _find_tsc_reference_ratio_row_values(
+            q3_ratio = _find_tsc_matrix_reference_values(
                 df_q3,
                 mat,
                 reference_ratio_label,
                 quarter_label,
-                raw_cols,
-                comp_col,
-                prefer_quarter=False,
+                category_label,
+                raw_metadata,
+                legacy_raw_cols,
+                legacy_spec_map,
+                label_kind='ratio',
             )
-
-            def _reference_source_with_zero(source):
-                out = dict(source or {})
-                for _, code in raw_cols:
-                    if _is_missing_number(out.get(code)):
-                        out[code] = 0.0
-                if comp_col is not None and _is_missing_number(out.get('综合单价')):
-                    out['综合单价'] = 0.0
-                return out
-
+            q3_amount = _with_summaries(q3_amount, 'sum') if q3_amount else {}
+            q3_ratio = _with_summaries(q3_ratio, 'sum') if q3_ratio else {}
             for label, source in [
-                (f'{month_label}实际单价', raw_unit),
-                (reference_price_label, _reference_source_with_zero(q3_price)),
-                (f'{month_label}规格占比', raw_ratio),
-                (reference_ratio_label, _reference_source_with_zero(q3_ratio)),
+                (f'{month_label}实际单价', current_qty),
+                (reference_price_label, q3_amount),
+                (f'{month_label}规格占比', current_ratio),
+                (reference_ratio_label, q3_ratio),
+                ('差异', current_unit),
             ]:
                 row = {'物料号': mat, '物料描述': mat_desc, '行类型': label, '分类': category_label}
-                for _, code in raw_cols:
-                    row[code] = source.get(code)
-                row['综合单价'] = source.get('综合单价')
+                for key in matrix_cols:
+                    row[key] = source.get(key)
+                row['综合单价'] = None
                 rows.append(row)
         if not rows:
-            return pd.DataFrame(columns=base_cols + raw_codes + ['综合单价'])
+            return pd.DataFrame(columns=base_cols + matrix_cols + ['综合单价'])
         return pd.DataFrame(rows)
 
-    raw_usage_legs = build_matrix_rows(legs_for_tsc['物料号'].unique(), raw_cols_legs, comp_col_legs, df_q3_legs, '腿肉')
-    raw_usage_breast = build_matrix_rows(breast_for_tsc['物料号'].unique(), raw_cols_breast, comp_col_breast, df_q3_breast, '胸肉')
-    if not raw_cols_other:
-        raw_cols_other, spec_map_other = _build_fallback_raw_columns(other_for_tsc['物料号'].unique())
-    raw_usage_other = build_matrix_rows(other_for_tsc['物料号'].unique(), raw_cols_other, comp_col_other, df_q3_other, '其他')
+    raw_usage_legs = build_matrix_rows(legs_for_tsc['物料号'].unique(), raw_cols_legs, comp_col_legs, df_q3_legs, spec_map_legs, '腿肉')
+    raw_usage_breast = build_matrix_rows(breast_for_tsc['物料号'].unique(), raw_cols_breast, comp_col_breast, df_q3_breast, spec_map_breast, '胸肉')
+    raw_usage_other = build_matrix_rows(other_for_tsc['物料号'].unique(), raw_cols_other, comp_col_other, df_q3_other, spec_map_other, '其他')
+    raw_usage_special = build_matrix_rows(
+        special_for_tsc['物料号'].unique(),
+        raw_cols_special,
+        comp_col_special,
+        df_q3_special,
+        spec_map_special,
+        '特殊',
+    )
+    spec_map_legs = {key: key.split('|', 1)[-1] for key in _tsc_matrix_columns('腿肉')}
+    spec_map_breast = {key: key.split('|', 1)[-1] for key in _tsc_matrix_columns('胸肉')}
+    spec_map_other = {key: key for key in _tsc_matrix_columns('其他')}
+    spec_map_special = {key: key.split('|', 1)[-1] for key in _tsc_matrix_columns('特殊')}
 
     # Build BB2-style detail sheets
     totals = {}
@@ -2476,7 +2897,11 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
     if '物料号' not in bb2.columns:
         bb2 = pd.DataFrame(columns=['物料号'])
     bb2 = bb2[bb2['物料号'].astype(str).str.startswith('3900')].copy()
-    order_map = {'胸肉': 0, '腿肉': 1, '其他': 2}
+
+    # 排除所有原料描述都含“碎肉”的物料
+    if excluded_all_scrap_desc_mats and not bb2.empty:
+        bb2 = bb2[~bb2["物料号"].astype(str).isin(excluded_all_scrap_desc_mats)].copy()
+    order_map = {'胸肉': 0, '腿肉': 1, '特殊': 2, '其他': 3}
     bb2['分类序'] = bb2['分类'].map(order_map).fillna(2)
     bb2 = bb2.sort_values(['分类序', '物料号'])
     bb2 = bb2.drop(columns=['分类序'])
@@ -2486,6 +2911,7 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
     bb2_legs = bb2[bb2['物料号'].isin(legs['物料号'])].copy()
     bb2_breast = bb2[bb2['物料号'].isin(breast['物料号'])].copy()
     bb2_other = bb2[bb2['物料号'].isin(other['物料号'])].copy()
+    bb2_special = bb2[bb2['物料号'].isin(special['物料号'])].copy()
 
     labor_records = []
     for mat, v in agg.items():
@@ -2531,23 +2957,47 @@ def compute(compare_file, rawlist_file, q3_file, map_file, sheet_name=None, mont
         )
         labor_df = pd.concat([total_row, labor_df], ignore_index=True)
 
+    special_market_category_map = {
+        _normalize_mat(mat): market_category_mapping.get(_normalize_mat(mat), '其他')
+        for mat in special_for_tsc['物料号'].unique()
+        if _normalize_mat(mat)
+    }
+    special_factor_map = {
+        _normalize_mat(mat): _scrap_factor_for_category(
+            '特殊',
+            v.get('物料描述', ''),
+            v.get('物料号', ''),
+            v.get('存在负值实际数量', False),
+            v.get('其他系数'),
+            v.get('计价系数'),
+        )
+        for mat, v in agg.items()
+        if v.get('分类') == '特殊' and _normalize_mat(mat)
+    }
+
     return (
         legs_for_tsc,
         breast_for_tsc,
         other_for_tsc,
+        special_for_tsc,
         bb2,
         bb2_legs,
         bb2_breast,
         bb2_other,
+        bb2_special,
         raw_usage_legs,
         raw_usage_breast,
         raw_usage_other,
+        raw_usage_special,
         spec_map_legs,
         spec_map_breast,
         spec_map_other,
+        spec_map_special,
         finished_df,
         labor_df,
         semi_category,
+        special_market_category_map,
+        special_factor_map,
     )
 
 
@@ -2573,12 +3023,28 @@ def to_excel_bytes(
     market_price_file=None,
     quarter_label=DEFAULT_QUARTER_LABEL,
     market_plant_code=None,
+    special=None,
+    bb2_special=None,
+    raw_usage_special=None,
+    spec_map_special=None,
+    special_market_category_map=None,
+    special_factor_map=None,
 ):
     output = io.BytesIO()
     fmt_money = '{:,.2f}'
     fmt_pct = '{:.0%}'
     fmt_int = '{:,.0f}'
     byproduct_factor_map = _current_byproduct_factor_map()
+    special = special.copy() if isinstance(special, pd.DataFrame) else other.iloc[0:0].copy()
+    bb2_special = bb2_special.copy() if isinstance(bb2_special, pd.DataFrame) else bb2_all.iloc[0:0].copy()
+    raw_usage_special = (
+        raw_usage_special.copy()
+        if isinstance(raw_usage_special, pd.DataFrame)
+        else raw_usage_other.iloc[0:0].copy()
+    )
+    spec_map_special = dict(spec_map_special or {})
+    special_market_category_map = dict(special_market_category_map or {})
+    special_factor_map = dict(special_factor_map or {})
 
     def _is_num(x):
         return isinstance(x, (int, float)) and not isinstance(x, bool)
@@ -2741,12 +3207,14 @@ def to_excel_bytes(
     legs_raw_for_tsc = _drop_scrap_tsc_mats_for_export(legs)
     breast_raw_for_tsc = _drop_scrap_tsc_mats_for_export(breast)
     other_raw_for_tsc = _drop_scrap_tsc_mats_for_export(other)
+    special_raw_for_tsc = _drop_scrap_tsc_mats_for_export(special)
     # Display/export of non-TSC sections can keep formatted style.
     legs = apply_formats(legs)
     breast = apply_formats(breast)
     other = apply_formats(other)
+    special = apply_formats(special)
 
-    def build_tsc_sheet(tsc_df, raw_usage_df, spec_map):
+    def build_tsc_sheet(tsc_df, raw_usage_df, spec_map, category_label):
         tsc_df = tsc_df.copy()
         raw_usage_df = raw_usage_df.copy()
         # raw_usage_df 已按 TSC 展示规则过滤（例如：碎肉半成品不展示）。
@@ -2797,8 +3265,14 @@ def to_excel_bytes(
         ordered_cols = [c for c in ordered_cols if c in merged.columns]
         header1 = {c: c for c in ordered_cols}
         header2 = {c: '' for c in ordered_cols}
-        for code in raw_cols:
-            header2[code] = spec_map.get(code, '')
+        for key in raw_cols:
+            if '|' in key:
+                kind, spec = key.split('|', 1)
+                header1[key] = kind
+                header2[key] = spec
+            else:
+                header1[key] = key
+                header2[key] = key
         if '综合单价' in ordered_cols:
             header2['综合单价'] = '综合单价'
         if '折扣比例' in ordered_cols:
@@ -2816,13 +3290,20 @@ def to_excel_bytes(
         for c in cost_cols:
             if c in header0:
                 header0[c] = '修形后成本'
+        if raw_cols:
+            header0[raw_cols[0]] = '修形前原料耗用'
         # Keep numeric values as-is; formatting should be applied at worksheet layer.
         merged_vals = merged[ordered_cols].copy()
 
-        # x月实际单价行：综合单价对齐为“修形前原料综合耗用单价”
+        # 综合单价沿用右侧成本口径；矩阵本身按数量/金额/占比/规格单价展示。
         if '行类型' in merged_vals.columns and '综合单价' in merged_vals.columns and '修形前原料综合耗用单价' in merged_vals.columns:
-            month_price_mask = merged_vals['行类型'].astype(str).eq(f'{month_label}实际单价')
-            merged_vals.loc[month_price_mask, '综合单价'] = merged_vals.loc[month_price_mask, '修形前原料综合耗用单价']
+            row_labels = merged_vals['行类型'].astype(str)
+            force_mask = row_labels.eq(f'{month_label}实际单价') | row_labels.eq('差异')
+            merged_vals.loc[force_mask, '综合单价'] = merged_vals.loc[force_mask, '修形前原料综合耗用单价']
+            reference_mask = row_labels.str.contains('实际单价', regex=False) & ~force_mask
+            missing_comp = merged_vals['综合单价'].isna()
+            fill_mask = reference_mask & missing_comp
+            merged_vals.loc[fill_mask, '综合单价'] = merged_vals.loc[fill_mask, '修形前原料综合耗用单价']
 
         # 右侧增加“折扣比例”：按修行后原料物料号取值，只在每组首行显示，后续样式阶段会随物料组合并。
         if '折扣比例' in ordered_cols:
@@ -2836,15 +3317,28 @@ def to_excel_bytes(
             ignore_index=True,
         )
 
-    tsc_legs = build_tsc_sheet(legs_raw_for_tsc, raw_usage_legs, spec_map_legs)
-    tsc_breast = build_tsc_sheet(breast_raw_for_tsc, raw_usage_breast, spec_map_breast)
-    tsc_other = build_tsc_sheet(other_raw_for_tsc, raw_usage_other, spec_map_other)
+    tsc_legs = build_tsc_sheet(legs_raw_for_tsc, raw_usage_legs, spec_map_legs, '腿肉')
+    tsc_breast = build_tsc_sheet(breast_raw_for_tsc, raw_usage_breast, spec_map_breast, '胸肉')
+    tsc_other = build_tsc_sheet(other_raw_for_tsc, raw_usage_other, spec_map_other, '其他')
+    tsc_special = build_tsc_sheet(special_raw_for_tsc, raw_usage_special, spec_map_special, '特殊')
     market_price_map = _load_market_price_map(market_price_file)
-    market_legs = market_breast = None
+    market_legs = market_breast = market_special = None
     if market_price_file is not None:
         market_plant = market_plant_code or prefix
         market_legs = _build_market_comparison_sheet(tsc_legs, market_plant, '腿肉', month_label, market_price_map, quarter_label)
         market_breast = _build_market_comparison_sheet(tsc_breast, market_plant, '胸肉', month_label, market_price_map, quarter_label)
+        market_special = _build_market_comparison_sheet(
+            tsc_special,
+            market_plant,
+            '其他',
+            month_label,
+            market_price_map,
+            quarter_label,
+            market_category_by_material=special_market_category_map,
+            calculation_category='特殊',
+            factor_by_material=special_factor_map,
+            market_scope='特殊',
+        )
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         apply_bb2_formats(finished_df).to_excel(writer, index=False, sheet_name=f'成品-{month_label}')
         apply_bb2_formats(labor_df).to_excel(writer, index=False, sheet_name='人工')
@@ -2859,6 +3353,10 @@ def to_excel_bytes(
             market_breast.to_excel(writer, index=False, sheet_name='胸肉行情-较季度', header=False)
         apply_bb2_formats(bb2_other).to_excel(writer, index=False, sheet_name=f'{prefix}其他')
         tsc_other.to_excel(writer, index=False, sheet_name='其他TSC', header=False)
+        apply_bb2_formats(bb2_special).to_excel(writer, index=False, sheet_name='特殊')
+        tsc_special.to_excel(writer, index=False, sheet_name='特殊TSC', header=False)
+        if market_special is not None:
+            market_special.to_excel(writer, index=False, sheet_name='特殊行情-较季度', header=False)
 
         header_fill = PatternFill(fill_type='solid', fgColor='FFFF00')
         header_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
@@ -2881,6 +3379,31 @@ def to_excel_bytes(
                 '半成品总成本',
             ]
             cols = list(tsc_df.columns)
+            fixed_cols = {
+                '产品族', '修行后原料', '使用半成品规格', '行类型', '影响口径', '综合单价',
+                '修形前原料综合耗用单价', '修形利用率', '损耗率',
+                '半成品原料成本', '半成品修形人工成本', '半成品总成本',
+                '半成品入库量', 'BOM', 'BOM占比', '折扣比例',
+            }
+            raw_cols = [c for c in cols if c not in fixed_cols]
+            raw_idxs = [cols.index(c) + 1 for c in raw_cols]
+            if raw_idxs:
+                ws.merge_cells(
+                    start_row=1,
+                    start_column=min(raw_idxs),
+                    end_row=1,
+                    end_column=max(raw_idxs),
+                )
+            for kind in ('鲜品', '冻品'):
+                kind_cols = [c for c in raw_cols if c.startswith(f'{kind}|') or c == f'{kind}合计']
+                kind_idxs = [cols.index(c) + 1 for c in kind_cols]
+                if kind_idxs:
+                    ws.merge_cells(
+                        start_row=2,
+                        start_column=min(kind_idxs),
+                        end_row=2,
+                        end_column=max(kind_idxs),
+                    )
             cost_idxs = [cols.index(c) + 1 for c in cost_cols if c in cols]
             if cost_idxs:
                 ws.merge_cells(
@@ -2889,6 +3412,12 @@ def to_excel_bytes(
                     end_row=1,
                     end_column=max(cost_idxs),
                 )
+            green_fill = PatternFill(fill_type='solid', fgColor='92D050')
+            total_cols = [c for c in raw_cols if c.endswith('合计') or c == '累计']
+            for name in total_cols:
+                col = cols.index(name) + 1
+                for row in range(3, ws.max_row + 1):
+                    ws.cell(row=row, column=col).fill = green_fill
             # set specific column widths for readability
             col_widths = {
                 '使用半成品规格': 28,
@@ -3080,9 +3609,9 @@ def to_excel_bytes(
                 is_diff_row = (row_type == '差异')
                 is_impact_row = (row_type == '对半成品成本的影响')
 
-                # Raw matrix + 综合单价 follows row type.
-                target_cols = raw_cols + (['综合单价'] if '综合单价' in col_idx else [])
-                for name in target_cols:
+                # Matrix rows: current quantity (t), reference amount (k CNY),
+                # ratios, then current specification unit price.
+                for name in raw_cols:
                     c = col_idx.get(name)
                     if not c:
                         continue
@@ -3090,9 +3619,17 @@ def to_excel_bytes(
                     if not isinstance(cell.value, (int, float)) or isinstance(cell.value, bool):
                         continue
                     if is_price_row:
-                        cell.number_format = fmt_unit_keep_zero if is_reference_price_row else fmt_unit
+                        cell.number_format = fmt_qty
                     elif is_ratio_row:
                         cell.number_format = fmt_pct0
+                    elif is_diff_row:
+                        cell.number_format = fmt_unit
+
+                c_comp = col_idx.get('综合单价')
+                if c_comp:
+                    cell = ws.cell(r, c_comp)
+                    if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                        cell.number_format = fmt_unit_keep_zero if is_reference_price_row else fmt_unit
 
                 # Cost block
                 for name in ['修形前原料综合耗用单价', '半成品原料成本', '半成品修形人工成本', '半成品总成本']:
@@ -3246,7 +3783,8 @@ def to_excel_bytes(
             if '分类' not in labor_src_df.columns:
                 return
 
-            src = labor_src_df[labor_src_df['分类'].isin(['胸肉', '腿肉', '其他'])].copy()
+            categories = ['胸肉', '腿肉', '特殊', '其他']
+            src = labor_src_df[labor_src_df['分类'].isin(categories)].copy()
             if src.empty:
                 return
 
@@ -3256,24 +3794,17 @@ def to_excel_bytes(
                 else:
                     src[c] = 0
 
-            chest_qty = round(float(src.loc[src['分类'] == '胸肉', '入库数量'].sum()), 2)
-            leg_qty = round(float(src.loc[src['分类'] == '腿肉', '入库数量'].sum()), 2)
-            other_qty = round(float(src.loc[src['分类'] == '其他', '入库数量'].sum()), 2)
-            chest_amt = round(float(src.loc[src['分类'] == '胸肉', '实际金额'].sum()), 2)
-            leg_amt = round(float(src.loc[src['分类'] == '腿肉', '实际金额'].sum()), 2)
-            other_amt = round(float(src.loc[src['分类'] == '其他', '实际金额'].sum()), 2)
-
-            chest_ratio = (chest_amt / chest_qty) if chest_qty else None
-            leg_ratio = (leg_amt / leg_qty) if leg_qty else None
-            other_ratio = (other_amt / other_qty) if other_qty else None
+            quantities = [round(float(src.loc[src['分类'] == cat, '入库数量'].sum()), 2) for cat in categories]
+            amounts = [round(float(src.loc[src['分类'] == cat, '实际金额'].sum()), 2) for cat in categories]
+            ratios = [(amt / qty) if qty else None for qty, amt in zip(quantities, amounts)]
 
             start_col = ws.max_column + 2
             start_row = 1
-            headers = ['胸肉', '腿肉', '其他']
+            headers = categories
             data_rows = [
-                [chest_qty, leg_qty, other_qty],
-                [chest_amt, leg_amt, other_amt],
-                [chest_ratio, leg_ratio, other_ratio],
+                quantities,
+                amounts,
+                ratios,
             ]
 
             thin = Side(border_style='thin', color='000000')
@@ -3295,9 +3826,8 @@ def to_excel_bytes(
                     else:
                         cell.number_format = '0.00'
 
-            ws.column_dimensions[get_column_letter(start_col)].width = 12
-            ws.column_dimensions[get_column_letter(start_col + 1)].width = 12
-            ws.column_dimensions[get_column_letter(start_col + 2)].width = 12
+            for offset in range(len(categories)):
+                ws.column_dimensions[get_column_letter(start_col + offset)].width = 12
 
         def _fill_desc_blanks(ws):
             # fill blank descriptions by carrying forward within same material
@@ -3319,7 +3849,7 @@ def to_excel_bytes(
                 else:
                     last_desc[key] = desc_cell.value
 
-        for sheet_name in ['半成品', f'{prefix}腿肉', f'{prefix}胸肉', f'{prefix}其他']:
+        for sheet_name in ['半成品', f'{prefix}腿肉', f'{prefix}胸肉', f'{prefix}其他', '特殊']:
             if sheet_name in writer.book.sheetnames:
                 _style_bb2_headers(writer.book[sheet_name])
                 _align_bb2_sheet(writer.book[sheet_name])
@@ -3364,6 +3894,7 @@ def to_excel_bytes(
             ('腿肉TSC', tsc_legs),
             ('胸肉TSC', tsc_breast),
             ('其他TSC', tsc_other),
+            ('特殊TSC', tsc_special),
         ]:
             _style_tsc_headers(writer.book[sheet_name], tsc_df)
             _align_tsc_sheet(writer.book[sheet_name], tsc_df)
@@ -3373,6 +3904,7 @@ def to_excel_bytes(
         for sheet_name, market_df in [
             ('腿肉行情-较季度', market_legs),
             ('胸肉行情-较季度', market_breast),
+            ('特殊行情-较季度', market_special),
         ]:
             if market_df is None or sheet_name not in writer.book.sheetnames:
                 continue
@@ -3435,6 +3967,7 @@ def to_excel_bytes(
             ('腿肉TSC', tsc_legs, bb2_legs),
             ('胸肉TSC', tsc_breast, bb2_breast),
             ('其他TSC', tsc_other, bb2_other),
+            ('特殊TSC', tsc_special, bb2_special),
         ]:
             _fill_tsc_instock_qty(writer.book[sheet_name], tsc_df, bb2_df)
 
@@ -3517,6 +4050,7 @@ def to_excel_bytes(
             ('腿肉TSC', tsc_legs),
             ('胸肉TSC', tsc_breast),
             ('其他TSC', tsc_other),
+            ('特殊TSC', tsc_special),
         ]:
             _merge_same_spec(writer.book[sheet_name], tsc_df)
             _merge_product_group(writer.book[sheet_name], tsc_df)
@@ -3524,6 +4058,7 @@ def to_excel_bytes(
         for sheet_name, market_df in [
             ('腿肉行情-较季度', market_legs),
             ('胸肉行情-较季度', market_breast),
+            ('特殊行情-较季度', market_special),
         ]:
             if market_df is None or sheet_name not in writer.book.sheetnames:
                 continue
@@ -3619,7 +4154,7 @@ def to_excel_bytes(
             # 参考表：碎肉单价 = 分割前单价 * 系数；其他按物料描述分别取系数后汇总。
             before_unit = (before_amt / before_qty) if before_qty else None
             category_label = str(category_label).strip()
-            if category_label == '其他':
+            if category_label in {'其他', '特殊'}:
                 desc_col = '物料描述(不含琵琶腿/全腿和无抗）' if '物料描述(不含琵琶腿/全腿和无抗）' in labor_rows.columns else '物料描述'
                 labor_rows[desc_col] = labor_rows[desc_col].fillna('').astype(str).str.strip()
                 labor_rows['物料号'] = labor_rows['物料号'].apply(_normalize_mat)
@@ -3869,8 +4404,8 @@ def to_excel_bytes(
             if not target_col:
                 return
             start_row = 5 if ws.title in (
-                '腿肉TSC', '胸肉TSC', '其他TSC',
-                '腿肉行情-较季度', '胸肉行情-较季度',
+                '腿肉TSC', '胸肉TSC', '其他TSC', '特殊TSC',
+                '腿肉行情-较季度', '胸肉行情-较季度', '特殊行情-较季度',
             ) else 2
             for r in range(start_row, ws.max_row + 1):
                 cell = ws.cell(r, target_col)
@@ -3895,7 +4430,12 @@ def to_excel_bytes(
 
         def _remove_thousand_sep_for_main_ids(ws):
             # XX腿肉/XX胸肉: keep main-table material/raw ids as plain integers without touching appended blocks.
-            if ws.title.endswith('TSC') or not (ws.title.endswith('腿肉') or ws.title.endswith('胸肉') or ws.title.endswith('其他')):
+            if ws.title.endswith('TSC') or not (
+                ws.title.endswith('腿肉')
+                or ws.title.endswith('胸肉')
+                or ws.title.endswith('其他')
+                or ws.title == '特殊'
+            ):
                 return
             target_cols = []
             for c in range(1, ws.max_column + 1):
@@ -3919,7 +4459,12 @@ def to_excel_bytes(
 
         def _remove_thousand_sep_for_append_ids(ws):
             # XX腿肉/XX胸肉: keep appended raw/semi id columns as plain integers without thousand separators.
-            if ws.title.endswith('TSC') or not (ws.title.endswith('腿肉') or ws.title.endswith('胸肉') or ws.title.endswith('其他')):
+            if ws.title.endswith('TSC') or not (
+                ws.title.endswith('腿肉')
+                or ws.title.endswith('胸肉')
+                or ws.title.endswith('其他')
+                or ws.title == '特殊'
+            ):
                 return
             labor_head = None
             for r in range(1, ws.max_row + 1):
@@ -3970,6 +4515,7 @@ def to_excel_bytes(
             (f'{prefix}腿肉', bb2_legs, '腿肉'),
             (f'{prefix}胸肉', bb2_breast, '胸肉'),
             (f'{prefix}其他', bb2_other, '其他'),
+            ('特殊', bb2_special, '特殊'),
         ]:
             if sheet_name in writer.book.sheetnames:
                 _append_labor_cost_block(writer.book[sheet_name], bb2_df, category_label)
@@ -3977,9 +4523,9 @@ def to_excel_bytes(
 
         # 网格线：TSC + XX腿肉/XX胸肉/XX其他
         for sheet_name in [
-            f'{prefix}腿肉', f'{prefix}胸肉', f'{prefix}其他',
-            '腿肉TSC', '胸肉TSC', '其他TSC',
-            '腿肉行情-较季度', '胸肉行情-较季度',
+            f'{prefix}腿肉', f'{prefix}胸肉', f'{prefix}其他', '特殊',
+            '腿肉TSC', '胸肉TSC', '其他TSC', '特殊TSC',
+            '腿肉行情-较季度', '胸肉行情-较季度', '特殊行情-较季度',
         ]:
             if sheet_name in writer.book.sheetnames:
                 _apply_grid_borders(writer.book[sheet_name])
@@ -3994,7 +4540,10 @@ def to_excel_bytes(
             _center_dash_cells(ws)
 
         for ws in writer.book.worksheets:
-            if ws.title in ('腿肉TSC', '胸肉TSC', '其他TSC', '腿肉行情-较季度', '胸肉行情-较季度'):
+            if ws.title in (
+                '腿肉TSC', '胸肉TSC', '其他TSC', '特殊TSC',
+                '腿肉行情-较季度', '胸肉行情-较季度', '特殊行情-较季度',
+            ):
                 _autofit(ws, min_width=10, max_width=50, padding=4)
             else:
                 _autofit(ws)
@@ -4014,19 +4563,25 @@ if file_compare and file_rawlist and file_q3 and file_map:
             legs_df,
             breast_df,
             other_df,
+            special_df,
             bb2_all,
             bb2_legs,
             bb2_breast,
             bb2_other,
+            bb2_special,
             raw_usage_legs,
             raw_usage_breast,
             raw_usage_other,
+            raw_usage_special,
             spec_map_legs,
             spec_map_breast,
             spec_map_other,
+            spec_map_special,
             finished_df,
             labor_df,
             semi_category,
+            special_market_category_map,
+            special_factor_map,
         ) = compute(
             file_compare,
             file_rawlist,
@@ -4043,6 +4598,7 @@ if file_compare and file_rawlist and file_q3 and file_map:
         display_legs = _drop_hidden_cols(legs_df)
         display_breast = _drop_hidden_cols(breast_df)
         display_other = _drop_hidden_cols(other_df)
+        display_special = _drop_hidden_cols(special_df)
 
         st.success('计算完成')
         if not display_legs.empty:
@@ -4054,7 +4610,10 @@ if file_compare and file_rawlist and file_q3 and file_map:
         if not display_other.empty:
             st.subheader('其他')
             st.dataframe(_format_tsc_display(display_other), use_container_width=True)
-        if display_legs.empty and display_breast.empty and display_other.empty:
+        if not display_special.empty:
+            st.subheader('特殊')
+            st.dataframe(_format_tsc_display(display_special), use_container_width=True)
+        if display_legs.empty and display_breast.empty and display_other.empty and display_special.empty:
             st.info('本次计算没有可显示的数据。')
 
         try:
@@ -4092,19 +4651,28 @@ if file_compare and file_rawlist and file_q3 and file_map:
                 file_market_price,
                 quarter_label,
                 market_plant_code,
+                special=special_df,
+                bb2_special=bb2_special,
+                raw_usage_special=raw_usage_special,
+                spec_map_special=spec_map_special,
+                special_market_category_map=special_market_category_map,
+                special_factor_map=special_factor_map,
             )
             has_any = (
                 (not display_legs.empty)
                 or (not display_breast.empty)
                 or (not display_other.empty)
+                or (not display_special.empty)
                 or (not bb2_all.empty)
                 or (not bb2_legs.empty)
                 or (not bb2_breast.empty)
                 or (not bb2_other.empty)
+                or (not bb2_special.empty)
                 or (not labor_df.empty)
                 or (not raw_usage_legs.empty)
                 or (not raw_usage_breast.empty)
                 or (not raw_usage_other.empty)
+                or (not raw_usage_special.empty)
             )
             if has_any:
                 st.session_state['download_data'] = data
